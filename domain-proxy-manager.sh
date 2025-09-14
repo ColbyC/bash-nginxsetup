@@ -1,250 +1,355 @@
 #!/bin/bash
-# Author: Colby Cail
-# Date: 2025-07-10
-# Purpose: Manage secure multi-domain NGINX reverse proxies with TLS, redirect handling, rollback, and config validation
+# Rewritten: Manage secure multi-domain NGINX reverse proxies with ACME
 
 set -euo pipefail
 
-NGINX_CONF_DIR="/etc/nginx/conf.d/domains"
-NGINX_CERT_DIR="/etc/nginx/certs"
-BACKUP_DIR="/etc/nginx/backups"
-ERROR_CONF="/etc/nginx/conf.d/common/error-pages.conf"
-HEADERS_CONF="/etc/nginx/conf.d/common/security-headers.conf"
-ACME_SH="/root/.acme.sh/acme.sh"
+readonly NGINX_CONF_DIR="/etc/nginx/conf.d/domains"
+readonly NGINX_CERT_DIR="/etc/ssl/clients"
+readonly BACKUP_DIR="/etc/nginx/backups"
+readonly COMMON_DIR="/etc/nginx/conf.d/common"
+readonly ERROR_CONF="${COMMON_DIR}/error-pages.conf"
+readonly HEADERS_CONF="${COMMON_DIR}/security-headers.conf"
+readonly SSL_CONF="${COMMON_DIR}/ssl-params.conf"
+readonly ACME_WEBROOT="/var/www/acme-webroot"
 
-mkdir -p "$NGINX_CONF_DIR" "$NGINX_CERT_DIR" "$BACKUP_DIR"
+# ACME renewal user model (mirrors bootstrap_acme_renewal_user.sh and init)
+readonly RENEW_USER="${RENEW_USER:-acmebot}"
+readonly RENEW_HOME="${RENEW_HOME:-/var/lib/acme}"
+readonly ACME_SH="${RENEW_HOME}/.acme.sh/acme.sh"
+readonly DEPLOY_HELPER="${DEPLOY_HELPER:-/usr/local/sbin/acme-deploy}"
 
-function banner() {
-    echo -e "\n\033[1;34m== NGINX DOMAIN PROXY MANAGER ==\033[0m"
+info() { printf "\033[1;34m[+] %s\033[0m\n" "$*"; }
+warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
+ok()   { printf "\033[1;32m[\xE2\x9C\x93] %s\033[0m\n" "$*"; }
+
+require_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        echo "[!] This script must be run as root" >&2
+        exit 1
+    fi
 }
 
-function usage() {
-    echo -e "\nUsage:"
-    echo "  $0 add <domain> <proxy_url>           Add domain with proxy"
-    echo "  $0 redirect <domain> <from> <to>      Add path redirect"
-    echo "  $0 rollback <domain>                  Roll back to last config"
-    echo "  $0 list                                List all domains"
-    echo "  $0 reload                              Reload NGINX"
+ensure_layout() {
+    mkdir -p "${NGINX_CONF_DIR}" "${NGINX_CERT_DIR}" "${BACKUP_DIR}"
+    for f in "${ERROR_CONF}" "${HEADERS_CONF}" "${SSL_CONF}" "${COMMON_DIR}/acme-challenge.conf"; do
+        if [[ ! -f "$f" ]]; then
+            warn "Missing common include: $f. Run ./domain-proxy-init.sh first."
+            exit 1
+        fi
+    done
+    if [[ ! -x "$DEPLOY_HELPER" ]]; then
+        warn "Deploy helper missing at ${DEPLOY_HELPER}. Run ./domain-proxy-init.sh first."
+        exit 1
+    fi
+}
+
+usage() {
+    cat <<USAGE
+Usage:
+  $0 add <domain> <proxy_url>           Add domain with reverse proxy
+  $0 ssl <domain> [webroot_path]        Add static site (TLS) from disk
+  $0 site <domain> [webroot_path]       Alias of 'ssl' for static sites
+  $0 redirect <domain> <from> <to>      Add path redirect (proxy to URL)
+  $0 rollback <domain>                  Roll back the last config
+  $0 list                                List all domains
+  $0 reload                              Validate and reload NGINX
+USAGE
     exit 1
 }
 
-function precheck_dns() {
-    local domain="$1"
-    echo "[*] Verifying DNS resolution for $domain..."
-    if ! dig +short "$domain" > /dev/null; then
-        echo "[!] DNS resolution failed for $domain"
-        return 1
-    fi
-    return 0
+valid_domain() {
+    local d="$1"
+    [[ "$d" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]] && [[ ${#d} -le 253 ]]
 }
 
-function backup_config() {
+dns_resolves() {
+    local d="$1"
+    local out
+    out=$(dig +short A "$d" 2>/dev/null || true)
+    [[ -n "$out" ]] || out=$(dig +short AAAA "$d" 2>/dev/null || true)
+    [[ -n "$out" ]]
+}
+
+backup_config() {
     local domain="$1"
-    local conf_file="$NGINX_CONF_DIR/$domain.conf"
-    local timestamp
-    timestamp=$(date +"%Y%m%d%H%M%S")
+    local conf_file="${NGINX_CONF_DIR}/${domain}.conf"
     if [[ -f "$conf_file" ]]; then
-        cp "$conf_file" "$BACKUP_DIR/$domain.conf.bak.$timestamp"
-        echo "[*] Backup saved: $BACKUP_DIR/$domain.conf.bak.$timestamp"
+        local ts; ts=$(date +%Y%m%d%H%M%S)
+        cp "$conf_file" "${BACKUP_DIR}/${domain}.conf.bak.${ts}"
+        info "Backup saved: ${BACKUP_DIR}/${domain}.conf.bak.${ts}"
     fi
 }
 
-function rollback_domain() {
+rollback_domain() {
     local domain="$1"
-    local last_backup
-    last_backup=$(ls -t "$BACKUP_DIR"/"$domain".conf.bak.* 2>/dev/null | head -n 1)
-
-    if [[ -z "$last_backup" ]]; then
-        echo "[!] No backup found for $domain"
+    local last
+    last=$(ls -t "${BACKUP_DIR}/${domain}.conf.bak."* 2>/dev/null | head -n1 || true)
+    if [[ -z "$last" ]]; then
+        warn "No backup found for ${domain}"
         exit 1
     fi
-
-    echo "[*] Rolling back to: $last_backup"
-    cp "$last_backup" "$NGINX_CONF_DIR/$domain.conf"
-    reload_nginx
+    cp "$last" "${NGINX_CONF_DIR}/${domain}.conf"
+    ok "Rolled back ${domain} to ${last}"
 }
 
-function ensure_cert() {
+ensure_cert() {
     local domain="$1"
-    local cert_path="$NGINX_CERT_DIR/$domain"
+    local cert_path="${NGINX_CERT_DIR}/${domain}"
     mkdir -p "$cert_path"
 
-    if ! precheck_dns "$domain"; then
-        echo "[!] Aborting certificate request."
+    info "Checking DNS for ${domain}"
+    if ! dns_resolves "$domain"; then
+        warn "Domain ${domain} does not resolve. Aborting."
         exit 1
     fi
 
-    echo "[*] Issuing certificate for $domain (webroot first)..."
-    if ! $ACME_SH --issue -d "$domain" --webroot /var/www/html; then
-        echo "[!] Webroot challenge failed, trying DNS challenge..."
-        if ! $ACME_SH --issue --dns dns_cf -d "$domain"; then
-            echo "[✗] DNS challenge also failed."
+    if [[ ! -x "$ACME_SH" ]]; then
+        warn "acme.sh not found at $ACME_SH. Run ./domain-proxy-init.sh first."
+        exit 1
+    fi
+
+    # Preflight HTTP-01: write token as renewal user and fetch via nginx
+    preflight_http01 "$domain"
+
+    info "Issuing certificate (HTTP-01 webroot first) as ${RENEW_USER}"
+    if ! sudo -u "$RENEW_USER" -H "$ACME_SH" --issue -d "$domain" -w "$ACME_WEBROOT" >/dev/null; then
+        warn "Webroot challenge failed. Trying DNS challenge (Cloudflare) if env present."
+        if [[ -n "${CF_Token:-}" || ( -n "${CF_Key:-}" && -n "${CF_Email:-}" ) ]]; then
+            # Preserve env for CF_* when switching user
+            sudo -E -u "$RENEW_USER" -H "$ACME_SH" --issue --dns dns_cf -d "$domain"
+        else
+            warn "Cloudflare credentials not provided. Export CF_Token or CF_Key/CF_Email."
             exit 1
         fi
     fi
 
-    $ACME_SH --install-cert -d "$domain" \
-        --key-file "$cert_path/key.pem" \
-        --fullchain-file "$cert_path/full.pem" \
-        --reloadcmd "systemctl reload nginx"
+    # Install mapping to a stash under renewal home, deploy via helper (sudo)
+    local stash_dir="${RENEW_HOME}/deploy-stash/${domain}"
+    sudo -u "$RENEW_USER" -H mkdir -p "$stash_dir"
+    sudo -u "$RENEW_USER" -H "$ACME_SH" --install-cert -d "$domain" \
+        --key-file       "${stash_dir}/key.pem" \
+        --fullchain-file "${stash_dir}/full.pem" \
+        --reloadcmd      "sudo ${DEPLOY_HELPER} ${domain} ${stash_dir}/key.pem ${stash_dir}/full.pem ${NGINX_CERT_DIR} 'systemctl reload nginx'" >/dev/null
 }
 
-function create_conf() {
-    local domain="$1"
-    local proxy_url="$2"
-    local conf_file="$NGINX_CONF_DIR/$domain.conf"
-
-    echo "[*] Creating NGINX config for $domain → $proxy_url"
-    cat > "$conf_file" <<EOF
+write_proxy_conf() {
+    local domain="$1" url="$2" conf_file="${NGINX_CONF_DIR}/${domain}.conf"
+    cat >"$conf_file" <<EOF
 server {
     listen 443 ssl http2;
-    server_name $domain;
+    server_name ${domain};
+    server_tokens off;
 
-    ssl_certificate     $NGINX_CERT_DIR/$domain/full.pem;
-    ssl_certificate_key $NGINX_CERT_DIR/$domain/key.pem;
+    ssl_certificate     ${NGINX_CERT_DIR}/${domain}/${domain}.crt;
+    ssl_certificate_key ${NGINX_CERT_DIR}/${domain}/${domain}.key;
 
-    include $HEADERS_CONF;
-    include $ERROR_CONF;
+    include ${SSL_CONF};
+    include ${HEADERS_CONF};
+    include ${ERROR_CONF};
+    include ${COMMON_DIR}/acme-challenge.conf;
 
     access_log /var/log/nginx/${domain}.access.log;
     error_log  /var/log/nginx/${domain}.error.log;
 
     location / {
-        proxy_pass $proxy_url;
-        proxy_ssl_verify off;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_pass ${url};
+        proxy_http_version 1.1;
+        proxy_set_header Host               \$host;
+        proxy_set_header X-Real-IP          \$remote_addr;
+        proxy_set_header X-Forwarded-For    \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto  \$scheme;
+        proxy_set_header Upgrade            \$http_upgrade;
+        proxy_set_header Connection         \"upgrade\";
+        proxy_ssl_server_name on;
+        proxy_redirect off;
+        proxy_read_timeout 60s;
         limit_req zone=ratelimit_zone burst=20 nodelay;
     }
 }
 
 server {
     listen 80;
-    server_name $domain;
-    return 301 https://\$host\$request_uri;
+    server_name ${domain};
+    server_tokens off;
+    include ${COMMON_DIR}/acme-challenge.conf;
+    location / { return 301 https://\$host\$request_uri; }
 }
 EOF
 }
 
-function add_domain() {
-    local domain="$1"
-    local proxy_url="$2"
+write_static_site_conf() {
+    local domain="$1" webroot="${2:-/var/www/html}" conf_file="${NGINX_CONF_DIR}/${domain}.conf"
+    mkdir -p "$webroot" && chown -R www-data:www-data "$webroot"
+    cat >"$conf_file" <<EOF
+server {
+    listen 443 ssl http2;
+    server_name ${domain};
+    server_tokens off;
 
-    if [[ ! "$domain" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-        echo "[!] Invalid domain: $domain"
-        exit 1
-    fi
+    ssl_certificate     ${NGINX_CERT_DIR}/${domain}/${domain}.crt;
+    ssl_certificate_key ${NGINX_CERT_DIR}/${domain}/${domain}.key;
 
-    if [[ ! "$proxy_url" =~ ^https?:// ]]; then
-        echo "[!] Invalid proxy URL: $proxy_url"
-        exit 1
-    fi
+    include ${SSL_CONF};
+    include ${HEADERS_CONF};
+    include ${ERROR_CONF};
+    include ${COMMON_DIR}/acme-challenge.conf;
 
-    backup_config "$domain"
-    ensure_cert "$domain"
-    create_conf "$domain" "$proxy_url"
-    echo "[✓] Domain $domain configured."
+    access_log /var/log/nginx/${domain}.access.log;
+    error_log  /var/log/nginx/${domain}.error.log;
+
+    root ${webroot};
+    index index.html index.htm;
+    location / {
+        try_files \$uri \$uri/ =404;
+        limit_req zone=ratelimit_zone burst=20 nodelay;
+    }
 }
 
-function add_redirect() {
-    local domain="$1"
-    local from_path="$2"
-    local to_url="$3"
-    local conf_file="$NGINX_CONF_DIR/$domain.conf"
+server {
+    listen 80;
+    server_name ${domain};
+    server_tokens off;
+    include ${COMMON_DIR}/acme-challenge.conf;
+    location / { return 301 https://\$host\$request_uri; }
+}
+EOF
+}
 
-    if [[ ! -f "$conf_file" ]]; then
-        echo "[!] Domain config not found: $domain"
-        exit 1
+# Backward-compatible name kept for callers and docs
+write_ssl_only_conf() { write_static_site_conf "$@"; }
+
+add_redirect_block() {
+    local conf_file="$1" from_path="$2" to_url="$3"
+    # Normalize path to ensure trailing slash block + exact match
+    [[ "$from_path" == */ ]] || from_path+="/"
+
+    if grep -q "location ${from_path}" "$conf_file"; then
+        warn "Redirect for ${from_path} already exists in $(basename "$conf_file")"
+        return 0
     fi
 
-    if [[ ! "$from_path" =~ ^/.* ]]; then
-        echo "[!] Redirect path must start with '/'"
-        exit 1
-    fi
-
-    if [[ ! "$to_url" =~ ^https?:// ]]; then
-        echo "[!] Invalid redirect target: $to_url"
-        exit 1
-    fi
-
-    backup_config "$domain"
-    echo "[*] Adding redirect to $domain: $from_path → $to_url"
-
-    # Ensure trailing slash in from_path
-    [[ "${from_path}" != */ ]] && from_path="${from_path}/"
-
+    # Insert blocks just after the first location / block inside the 443 server
     awk -v path="$from_path" -v target="$to_url" '
-    BEGIN {
-        block1 = "    location = " substr(path, 1, length(path)-1) " {\n" \
-                 "        return 301 " path ";\n" \
-                 "    }\n"
+        BEGIN {
+          block1 = "    location = " substr(path, 1, length(path)-1) " {\n        return 301 " path ";\n    }\n";
+          block2 = "    location " path " {\n        proxy_pass " target ";\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_ssl_server_name on;\n        proxy_redirect off;\n        limit_req zone=ratelimit_zone burst=20 nodelay;\n    }\n";
+          inserted=0; in_server=0; depth=0; ssl_listen=0;
+        }
+        {
+          line=$0
+          # Detect entering a server block
+          if (match(line, /^\s*server\s*\{/)) { in_server=1; depth=1; ssl_listen=0 }
+          else if (in_server) {
+            if (index(line, "{")>0) depth++
+            if (index(line, "}")>0) depth--
+          }
 
-        block2 = "    location " path " {\n" \
-                 "        proxy_pass " target ";\n" \
-                 "        proxy_ssl_verify off;\n" \
-                 "        proxy_set_header Host $host;\n" \
-                 "        proxy_set_header X-Forwarded-For $remote_addr;\n" \
-                 "        limit_req zone=ratelimit_zone burst=20 nodelay;\n" \
-                 "    }\n"
-    }
-    {
-        print
-        if ($0 ~ /location \// && !found) {
+          # Flag SSL listen inside this server
+          if (in_server && line ~ /listen\s+443/) ssl_listen=1
+
+          print line
+
+          # After the root location line in the 443 server, inject our blocks once
+          if (in_server && ssl_listen && !inserted && line ~ /location\s+\/\s*\{/) {
             print block1
             print block2
-            found = 1
+            inserted=1
+          }
+
+          # Leaving server block
+          if (in_server && depth==0) { in_server=0; ssl_listen=0 }
         }
-    }' "$conf_file" > "${conf_file}.tmp" && mv "${conf_file}.tmp" "$conf_file"
+    ' "$conf_file" >"${conf_file}.tmp" && mv "${conf_file}.tmp" "$conf_file"
 }
 
-function list_domains() {
-    echo -e "\n\033[1;33mConfigured Domains:\033[0m"
-    for file in "$NGINX_CONF_DIR"/*.conf; do
-        [[ -f "$file" ]] || continue
-        domain=$(basename "$file" .conf)
-        echo -e "• \033[32m$domain\033[0m"
-        grep "proxy_pass" "$file" | sed 's/^/   ↪ /'
+reload_nginx() {
+    info "Validating NGINX configuration"
+    nginx -t
+    systemctl reload nginx
+    ok "NGINX reloaded"
+}
+
+add_domain() {
+    local domain="$1" proxy_url="$2"
+    valid_domain "$domain" || { warn "Invalid domain: $domain"; exit 1; }
+    [[ "$proxy_url" =~ ^https?:// ]] || { warn "Invalid proxy URL: $proxy_url"; exit 1; }
+    backup_config "$domain"
+    ensure_cert "$domain"
+    write_proxy_conf "$domain" "$proxy_url"
+    ok "Configured reverse proxy for ${domain} -> ${proxy_url}"
+}
+
+add_ssl_domain() {
+    local domain="$1" webroot="${2:-/var/www/html}"
+    valid_domain "$domain" || { warn "Invalid domain: $domain"; exit 1; }
+    backup_config "$domain"
+    ensure_cert "$domain"
+    write_static_site_conf "$domain" "$webroot"
+    ok "Configured static site for ${domain} (root: ${webroot})"
+}
+
+# Alias for clarity: non-proxy local-disk website
+add_site_domain() { add_ssl_domain "$@"; }
+
+add_redirect() {
+    local domain="$1" from_path="$2" to_url="$3" conf_file="${NGINX_CONF_DIR}/${domain}.conf"
+    [[ -f "$conf_file" ]] || { warn "Domain config not found: $domain"; exit 1; }
+    [[ "$from_path" =~ ^/ ]] || { warn "Redirect path must start with '/'"; exit 1; }
+    [[ "$to_url" =~ ^https?:// ]] || { warn "Invalid redirect target: $to_url"; exit 1; }
+    backup_config "$domain"
+    add_redirect_block "$conf_file" "$from_path" "$to_url"
+    ok "Added redirect on ${domain}: ${from_path} -> ${to_url}"
+}
+
+list_domains() {
+    printf "\033[1;33mConfigured Domains:\033[0m\n"
+    shopt -s nullglob
+    for file in "${NGINX_CONF_DIR}"/*.conf; do
+        local domain; domain=$(basename "$file" .conf)
+        if grep -q "proxy_pass" "$file"; then
+            printf "• %s (proxy)\n" "$domain"
+            grep -m1 "proxy_pass" "$file" | sed 's/^/   ↪ /'
+        else
+            printf "• %s (static)\n" "$domain"
+            grep -m1 "^\s*root\s" "$file" | sed 's/^/   📁 /'
+        fi
+        if [[ -f "${NGINX_CERT_DIR}/${domain}/${domain}.crt" ]]; then
+            printf "   ✓ cert installed\n"
+        else
+            printf "   ✗ cert missing\n"
+        fi
     done
 }
 
-function reload_nginx() {
-    echo "[*] Validating NGINX configuration..."
-    if nginx -t; then
-        echo "[*] Reloading NGINX..."
-        systemctl reload nginx
-        echo "[✓] NGINX reloaded."
-    else
-        echo "[✗] NGINX config invalid. Aborting reload."
+# Write-read test for HTTP-01 via nginx with Host header
+preflight_http01() {
+    local domain="$1"
+    local token=".preflight_$(date +%s)_$RANDOM"
+    local path="${ACME_WEBROOT}/.well-known/acme-challenge/${token}"
+    info "Preflight HTTP-01 for ${domain}"
+    sudo -u "$RENEW_USER" -H bash -lc "echo PREPASS > '$path'" || { warn "Failed to write preflight token"; exit 1; }
+    local out
+    out=$(curl -sS -H "Host: ${domain}" "http://127.0.0.1/.well-known/acme-challenge/${token}" || true)
+    rm -f "$path" || true
+    if [[ "$out" != "PREPASS" ]]; then
+        warn "Preflight failed for ${domain}. Check webroot serving and rewrite rules."
         exit 1
     fi
 }
 
-### MAIN ###
+main() {
+    require_root
+    ensure_layout
+    case "${1:-}" in
+        add)      [[ $# -eq 3 ]] || usage; add_domain "$2" "$3"; reload_nginx ;;
+        ssl)      [[ $# -ge 2 && $# -le 3 ]] || usage; add_ssl_domain "$2" "${3:-}"; reload_nginx ;;
+        site)     [[ $# -ge 2 && $# -le 3 ]] || usage; add_site_domain "$2" "${3:-}"; reload_nginx ;;
+        redirect) [[ $# -eq 4 ]] || usage; add_redirect "$2" "$3" "$4"; reload_nginx ;;
+        rollback) [[ $# -eq 2 ]] || usage; rollback_domain "$2"; reload_nginx ;;
+        list)     list_domains ;;
+        reload)   reload_nginx ;;
+        *)        usage ;;
+    esac
+}
 
-banner
-
-case "${1:-}" in
-    add)
-        [[ $# -eq 3 ]] || usage
-        add_domain "$2" "$3"
-        reload_nginx
-        ;;
-    redirect)
-        [[ $# -eq 4 ]] || usage
-        add_redirect "$2" "$3" "$4"
-        reload_nginx
-        ;;
-    rollback)
-        [[ $# -eq 2 ]] || usage
-        rollback_domain "$2"
-        ;;
-    list)
-        list_domains
-        ;;
-    reload)
-        reload_nginx
-        ;;
-    *)
-        usage
-        ;;
-esac
+main "$@"
